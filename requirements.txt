@@ -1,0 +1,11 @@
+torch
+transformers @ git+https://github.com/huggingface/transformers
+numpy
+librosa
+fastapi
+uvicorn[standard]
+python-multipart
+openai>=2.0
+python-dotenv
+httpx
+huggingface_hub

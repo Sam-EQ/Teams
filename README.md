@@ -13,11 +13,14 @@ transcript and minutes of meeting.
 2. OpenAI and Nemotron run on the same audio in parallel. Recordings over 12 minutes are split at silence
   near every 10 minutes for OpenAI (25 MB upload limit). Nemotron always sees the whole recording, so speaker
    labels stay consistent.
-3. Each OpenAI segment keeps its text exactly and goes to the Nemotron speaker it overlaps most.
-  OpenAI's own speaker labels are kept in `segments.json` for reference but not used.
+3. Each OpenAI segment keeps its text exactly and goes to the Nemotron speaker it overlaps most. OpenAI's own
+  speaker labels are too coarse to use directly (it often merges two people), but they break ties: overlap is weighted
+  by how often each Nemotron speaker carries that label, a short segment whose label differs from both neighbours is
+  treated as someone cutting in, and a segment Nemotron heard no speech in follows the nearest segment with its label.
 4. Speech Nemotron heard for at least `GAP_MIN_SECONDS` that no OpenAI text covers is cut out, transcribed
   on its own and given to that speaker. This recovers speech OpenAI drops, for example under laughter.
-5. Back-to-back lines from the same speaker are merged into turns, then the minutes are written.
+5. Back-to-back lines from the same speaker are merged into turns, then the minutes are written. When two people talk
+  over each other in fragments under a second long, each person's fragments are joined back up first.
 
 Overlapping speech is never cut up and re-transcribed, because short or overlapping clips make the model invent text.
 

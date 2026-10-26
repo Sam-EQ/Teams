@@ -3,21 +3,35 @@
 A service that turns a meeting recording into a speaker-attributed transcript and structured minutes of meeting.
 Recordings can be uploaded directly or imported from Microsoft Teams through Microsoft Graph.
 
-## Contents
+## Architecture
 
-- [Overview](#overview)
-- [Models](#models)
-- [Processing pipeline](#processing-pipeline)
-- [Requirements](#requirements)
-- [Installation](#installation)
-- [Running the service](#running-the-service)
-- [API reference](#api-reference)
-- [Microsoft Teams import](#microsoft-teams-import)
-- [Job storage](#job-storage)
-- [Configuration](#configuration)
-- [Troubleshooting](#troubleshooting)
-- [Limitations](#limitations)
-- [Project layout](#project-layout)
+```mermaid
+flowchart TD
+    A["Upload<br/>POST /jobs"] --> C
+    B["Teams link<br/>POST /jobs/teams"] --> G["Microsoft Graph<br/>download recording and Teams transcript"]
+    G --> C["Extract<br/>ffmpeg to 16 kHz mono WAV"]
+
+    C --> D1
+    C --> D2
+
+    subgraph Analyze["Analyze (in parallel)"]
+        D1["Transcription<br/>OpenAI gpt-4o-transcribe-diarize<br/>text and timestamps"]
+        D2["Diarization<br/>NVIDIA Nemotron-3-Diarization on local GPU<br/>who spoke when"]
+    end
+
+    D1 --> E
+    D2 --> E
+
+    subgraph Stitch["Stitch"]
+        E["Speaker assignment<br/>each text segment to a Nemotron speaker"] --> F["Gap recovery<br/>transcribe speech OpenAI missed"]
+        F --> H["Turn merging<br/>join consecutive lines per speaker"]
+    end
+
+    H --> I["Naming<br/>match Teams participants to speakers"]
+    I --> J["Minutes<br/>OpenAI structured output"]
+    J --> K[("data/job_id/<br/>transcript.json, minutes.json")]
+    K --> L["API<br/>transcript, minutes, speaker renaming"]
+```
 
 ## Overview
 

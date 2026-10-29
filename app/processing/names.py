@@ -1,11 +1,14 @@
 import re
 from collections import defaultdict
 
-from app.processing.assign import overlap
-from app.schemas.transcript import SpeakerSegment
+from app.schemas.transcript import SpeakerSegment, Timed, Turn
 
 TIMING = re.compile(r"([\d:.]+)\s*-->\s*([\d:.]+)")
 VOICE = re.compile(r"<v\s+([^>]+)>")
+
+
+def overlap(a: Timed, b: Timed) -> float:
+    return max(0.0, min(a.end, b.end) - max(a.start, b.start))
 
 
 def seconds(stamp: str) -> float:
@@ -25,11 +28,11 @@ def parse_vtt(text: str) -> list[SpeakerSegment]:
     return cues
 
 
-def match_names(cues: list[SpeakerSegment], speakers: list[SpeakerSegment], min_seconds: float) -> dict[str, str]:
+def match_names(cues: list[SpeakerSegment], turns: list[Turn], min_seconds: float) -> dict[str, str]:
     scores = defaultdict(float)
     for cue in cues:
-        for s in speakers:
-            scores[(s.speaker, cue.speaker)] += overlap(cue, s)
+        for turn in turns:
+            scores[(turn.speaker, cue.speaker)] += overlap(cue, turn)
     names = {}
     for (speaker, name), score in sorted(scores.items(), key=lambda item: item[1], reverse=True):
         if score < min_seconds:

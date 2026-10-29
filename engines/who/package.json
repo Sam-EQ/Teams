@@ -1,0 +1,11 @@
+{
+  "name": "who-engine",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "@desert-ant-labs/who": "4.2.1"
+  }
+}

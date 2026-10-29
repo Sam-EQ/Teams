@@ -6,15 +6,16 @@ import sys
 from pathlib import Path
 
 from app.audio.probe import probe_duration
+from app.core.config import DIARIZATION_ENGINE, ENGINES
 from app.bootstrap import build_services
 from app.main import LOG_FORMAT
 from app.schemas.job import Stage
 from app.services.minutes import clock
 
 
-async def run(path: Path):
+async def run(path: Path, engine: str):
     services = build_services()
-    job = services.store.create(path.name)
+    job = services.store.create(path.name, engine)
     source = f"source{path.suffix.lower()}"
     shutil.copy(path, services.store.dir(job.id) / source)
     services.store.update(job.id, source=source)
@@ -37,10 +38,11 @@ async def run(path: Path):
 def main():
     parser = argparse.ArgumentParser(description="Transcribe a meeting recording with speakers and minutes")
     parser.add_argument("file", type=Path)
+    parser.add_argument("--engine", default=DIARIZATION_ENGINE, choices=ENGINES)
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format=LOG_FORMAT)
     probe_duration(args.file)
-    asyncio.run(run(args.file))
+    asyncio.run(run(args.file, args.engine))
 
 
 if __name__ == "__main__":

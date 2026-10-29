@@ -23,7 +23,7 @@ async def lifespan(app: FastAPI):
         await services.teams.close()
 
 
-app = FastAPI(title="Meeting Transcription API", version="1.0.0", lifespan=lifespan)
+app = FastAPI(title="Meeting Transcription API", version="2.0.0", lifespan=lifespan)
 register_error_handlers(app)
 app.include_router(health.router)
 app.include_router(teams.router)

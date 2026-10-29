@@ -7,7 +7,8 @@ from app.audio.convert import cut
 @dataclass
 class Chunk:
     path: Path
-    offset: float
+    start: float
+    end: float
 
 
 def plan_cuts(duration: float, silences: list[float], target: float, window: float, max_length: float) -> list[float]:
@@ -23,10 +24,10 @@ def plan_cuts(duration: float, silences: list[float], target: float, window: flo
 
 def split_audio(wav: Path, out_dir: Path, duration: float, cuts: list[float]) -> list[Chunk]:
     if not cuts:
-        return [Chunk(path=wav, offset=0.0)]
+        return [Chunk(path=wav, start=0.0, end=duration)]
     out_dir.mkdir(parents=True, exist_ok=True)
     bounds = [0.0, *cuts, duration]
     return [
-        Chunk(path=cut(wav, out_dir / f"chunk_{index:03d}.wav", start, end), offset=start)
+        Chunk(path=cut(wav, out_dir / f"chunk_{index:03d}.wav", start, end), start=start, end=end)
         for index, (start, end) in enumerate(zip(bounds, bounds[1:]))
     ]

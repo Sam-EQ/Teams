@@ -1,11 +1,12 @@
 from openai import AsyncOpenAI
 
-from app.core.config import MINUTES_MODEL
+from app.core.config import KEYWORDS, MINUTES_MODEL
 from app.schemas.minutes import Minutes
 from app.schemas.transcript import Turn
 
 INSTRUCTIONS = """You write minutes of meeting from a speaker-labelled transcript.
 Use only what is said in the transcript. Do not invent facts, owners or dates.
+Spell the known terms exactly as given when they appear.
 title: a short title for the meeting.
 summary: 3 to 6 sentences.
 key_points: the main topics discussed.
@@ -36,7 +37,7 @@ class MinutesWriter:
         response = await self.client.responses.parse(
             model=MINUTES_MODEL,
             instructions=INSTRUCTIONS,
-            input=f"Unnamed speakers: {', '.join(unnamed) or 'none'}\n\nTranscript:\n{transcript}",
+            input=f"Known terms: {', '.join(KEYWORDS) or 'none'}\nUnnamed speakers: {', '.join(unnamed) or 'none'}\n\nTranscript:\n{transcript}",
             text_format=Minutes,
         )
         if response.output_parsed is None:

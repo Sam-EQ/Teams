@@ -22,7 +22,9 @@ class JobStats(BaseModel):
     duration_seconds: float
     speakers: int
     turns: int
-    gaps_filled: int
+    words: int = 0
+    diarization_seconds: float | None = None
+    teams_agreement: float | None = None
     processing_seconds: float
 
 
@@ -30,6 +32,7 @@ class Job(BaseModel):
     id: str
     filename: str
     source: str | None = None
+    engine: str = "nemotron"
     stage: Stage = Stage.queued
     error: str | None = None
     error_stage: Stage | None = None
@@ -41,3 +44,4 @@ class Job(BaseModel):
 
 class TeamsJobRequest(BaseModel):
     join_url: str
+    engine: str | None = None

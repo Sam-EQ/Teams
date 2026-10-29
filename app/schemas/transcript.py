@@ -14,9 +14,9 @@ class Timed(BaseModel):
         return round(value, 2)
 
 
-class TextSegment(Timed):
+class Word(Timed):
     text: str
-    label: str | None = None
+    speaker: str | None = None
 
 
 class SpeakerSegment(Timed):

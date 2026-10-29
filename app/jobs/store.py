@@ -30,8 +30,8 @@ class JobStore:
             raise JobNotFound(f"job {job_id} not found")
         return self.root / job_id
 
-    def create(self, filename: str) -> Job:
-        job = Job(id=uuid.uuid4().hex[:12], filename=filename, created_at=now(), updated_at=now())
+    def create(self, filename: str, engine: str) -> Job:
+        job = Job(id=uuid.uuid4().hex[:12], filename=filename, engine=engine, created_at=now(), updated_at=now())
         self.dir(job.id).mkdir(parents=True)
         self.save(job)
         return job

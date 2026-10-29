@@ -1,17 +1,23 @@
+import asyncio
+
 from fastapi import APIRouter, Request
 
-from app.core.config import DIARIZATION_MODE, MINUTES_MODEL, TRANSCRIBE_MODEL
+from app.core.config import DIARIZATION_ENGINE, KEYWORDS, MINUTES_MODEL, TIMING_MODEL, TRANSCRIBE_MODEL
 
 router = APIRouter()
 
 
 @router.get("/health")
-def health(request: Request):
+async def health(request: Request):
+    services = request.app.state.services
+    engines = {name: await asyncio.to_thread(d.health) for name, d in services.diarizers.items()}
     return {
         "ok": True,
-        "diarizer_device": request.app.state.services.diarizer.device,
-        "diarization_mode": DIARIZATION_MODE,
+        "default_engine": DIARIZATION_ENGINE,
+        "engines": engines,
         "transcribe_model": TRANSCRIBE_MODEL,
+        "timing_model": TIMING_MODEL,
         "minutes_model": MINUTES_MODEL,
-        "teams_import": request.app.state.services.teams is not None,
+        "keywords": KEYWORDS,
+        "teams_import": services.teams is not None,
     }

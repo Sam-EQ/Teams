@@ -1,18 +1,19 @@
 import asyncio
 from pathlib import Path
 
-from fastapi import APIRouter, BackgroundTasks, Body, Depends, File, UploadFile
+from fastapi import APIRouter, BackgroundTasks, Body, Depends, File, Form, UploadFile
 from fastapi.responses import StreamingResponse
 
 from app.api.deps import get_pipeline, get_store
 from app.audio.probe import probe_duration
-from app.core.config import MAX_UPLOAD_BYTES
+from app.core.config import DIARIZATION_ENGINE, MAX_UPLOAD_BYTES
 from app.core.errors import AppError, UnknownSpeaker, UploadTooLarge
 from app.jobs.store import JobStore
 from app.pipeline import Pipeline
 from app.schemas.job import TERMINAL_STAGES, Job
 from app.schemas.minutes import Minutes
 from app.schemas.transcript import NamedTurn, TranscriptView
+from app.services.diarization import check_engine
 
 router = APIRouter(prefix="/jobs", tags=["jobs"])
 READ_SIZE = 1024 * 1024
@@ -38,11 +39,13 @@ def transcript_view(store: JobStore, job: Job) -> TranscriptView:
 async def create_job(
     background: BackgroundTasks,
     file: UploadFile = File(...),
+    engine: str = Form(DIARIZATION_ENGINE),
     store: JobStore = Depends(get_store),
     pipeline: Pipeline = Depends(get_pipeline),
 ):
+    check_engine(engine)
     filename = Path(file.filename or "upload").name
-    job = store.create(filename)
+    job = store.create(filename, engine)
     source = store.dir(job.id) / f"source{Path(filename).suffix.lower()}"
     try:
         await save_upload(file, source)

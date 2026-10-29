@@ -26,6 +26,10 @@ class UnknownSpeaker(AppError):
     status_code = 422
 
 
+class UnknownEngine(AppError):
+    status_code = 422
+
+
 class MeetingNotFound(AppError):
     status_code = 404
 

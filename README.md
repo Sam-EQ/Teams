@@ -1,132 +1,38 @@
 # Meeting Transcription API
 
-A service that turns a meeting recording into a speaker-attributed transcript and structured minutes of meeting.
-Recordings can be uploaded directly or imported from Microsoft Teams through Microsoft Graph.
+Upload a meeting recording, or import one straight from Microsoft Teams, and get a speaker-separated
+transcript and minutes of meeting.
 
-## Architecture
+- Text: OpenAI `gpt-transcribe`, with a prompt and keyword hints
+- Word timing: OpenAI `whisper-1` word timestamps
+- Who spoke when, one of two engines chosen per job:
+  - `nemotron`: [`nvidia/Nemotron-3-Diarization`](https://huggingface.co/nvidia/Nemotron-3-Diarization) through Transformers, offline mode, on the local GPU
+  - `who`: [Desert Ant Labs Who](https://huggingface.co/desert-ant-labs/who) through its Node SDK, on the CPU, as a small service in `engines/who/`
+- Minutes: OpenAI (`MINUTES_MODEL`) with structured output
 
-```mermaid
-flowchart TD
-    A["Upload<br/>POST /jobs"] --> C
-    B["Teams link<br/>POST /jobs/teams"] --> G["Microsoft Graph<br/>download recording and Teams transcript"]
-    G --> C["Extract<br/>ffmpeg to 16 kHz mono WAV"]
+## How it works
 
-    C --> D1
-    C --> D2
+1. The upload is converted to 16 kHz mono audio. Recordings over 12 minutes are split at silence near every
+   10 minutes, because OpenAI accepts at most 25 MB per request.
+2. Three passes run in parallel on the same audio:
+   - `gpt-transcribe` writes the text, one chunk after another, each prompt carrying the end of the previous chunk
+     and the `KEYWORDS` list.
+   - `whisper-1` returns word timestamps for every chunk.
+   - The job's diarization engine runs over the whole recording. Nemotron, in offline mode, returns the probability of
+     each of up to 8 speakers every 10 ms. Who returns speaker turns, which are turned into the same 10 ms grid, so
+     everything after this step is identical for both engines.
+3. The `gpt-transcribe` words are matched to the `whisper-1` words. Matched words take whisper's times, the rest
+   are spread evenly between their matched neighbours.
+4. Each word goes to the speaker with the highest average probability over that word. Words with no
+   speech under them take the speaker of the word before. A run of one or two words between two runs of the same
+   speaker is merged into that speaker, unless it ends a sentence.
+5. Consecutive words from the same speaker become turns, then the minutes are written.
 
-    subgraph Analyze["Analyze (in parallel)"]
-        D1["Transcription<br/>OpenAI gpt-4o-transcribe-diarize<br/>text and timestamps"]
-        D2["Diarization<br/>NVIDIA Nemotron-3-Diarization on local GPU<br/>who spoke when"]
-    end
+## Setup
 
-    D1 --> E
-    D2 --> E
-
-    subgraph Stitch["Stitch"]
-        E["Speaker assignment<br/>each text segment to a Nemotron speaker"] --> F["Gap recovery<br/>transcribe speech OpenAI missed"]
-        F --> H["Turn merging<br/>join consecutive lines per speaker"]
-    end
-
-    H --> I["Naming<br/>match Teams participants to speakers"]
-    I --> J["Minutes<br/>OpenAI structured output"]
-    J --> K[("data/job_id/<br/>transcript.json, minutes.json")]
-    K --> L["API<br/>transcript, minutes, speaker renaming"]
-```
-
-## Overview
-
-The service accepts any audio or video file that ffmpeg can read and produces three outputs:
-
-| Output | Description |
-| --- | --- |
-| Transcript | Text with start and end times for every turn |
-| Speaker attribution | Each turn labelled `speaker_0`, `speaker_1`, and so on, with optional real names |
-| Minutes | Title, summary, key points, decisions, action items, open questions and suggested speaker names |
-
-Processing runs as a background job. Clients submit a recording, receive a job ID immediately, and either poll the
-job or subscribe to a server-sent event stream until it completes.
-
-## Models
-
-No single model produces accurate text and accurate speaker separation together, so the service combines three.
-
-| Task | Model | Runs on | Reason for the choice |
-| --- | --- | --- | --- |
-| Speech to text | OpenAI `gpt-4o-transcribe-diarize` | OpenAI API | High word accuracy with segment-level timestamps. It also returns its own speaker labels, but these frequently merge two people into one, so they are used only as a secondary signal. |
-| Speaker diarization | [`nvidia/Nemotron-3-Diarization`](https://huggingface.co/nvidia/Nemotron-3-Diarization) | Local GPU, through Transformers | A dedicated diarization model that separates voices more reliably than the transcription model. It processes the full recording in one pass, so speaker labels remain consistent across the whole meeting, and it has no per-request cost. |
-| Minutes | OpenAI, set by `MINUTES_MODEL` | OpenAI API | Summarisation requires a general language model. Structured output guarantees the response matches the `Minutes` schema. |
-
-In short, the words come from OpenAI and the speakers come from Nemotron.
-
-## Processing pipeline
-
-Each job moves through the following stages:
+Requirements: Python 3.11+, git, ffmpeg, an NVIDIA GPU.
 
 ```
-queued -> downloading (Teams imports only) -> extracting -> analyzing -> stitching -> minutes -> done
-```
-
-A job that fails at any stage is marked `failed`, with the stage recorded in `error_stage`.
-
-### 1. Extracting
-
-ffmpeg converts the source file to 16 kHz mono PCM (`audio.wav`), the format both models expect.
-
-### 2. Analyzing
-
-Transcription and diarization run concurrently on the same audio.
-
-- **Transcription.** OpenAI limits uploads to 25 MB. Recordings longer than 12 minutes are therefore split into
-  chunks of roughly 10 minutes, with each cut placed at the nearest silence so that no word is divided. Up to
-  `TRANSCRIBE_CONCURRENCY` chunks are sent in parallel and their timestamps are shifted back onto the full timeline.
-- **Diarization.** Nemotron always receives the complete recording. Splitting it would allow the same person to be
-  given different labels in different chunks.
-
-### 3. Stitching
-
-The two outputs are combined into a single transcript.
-
-1. **Speaker assignment.** Each OpenAI segment keeps its text exactly as returned and is assigned to the Nemotron
-   speaker it overlaps most. OpenAI's own speaker labels are used to resolve ambiguous cases:
-   - Overlap is weighted by how often each Nemotron speaker carries the segment's OpenAI label across the meeting.
-   - A short segment (up to 2 seconds) whose OpenAI label differs from the segments on both sides is treated as an
-     interjection and is not given to the person being interrupted, provided another plausible speaker overlaps it.
-   - A segment during which Nemotron detected no speech takes the speaker of the nearest segment with the same OpenAI
-     label, then the speaker most associated with that label, then the nearest Nemotron speaker.
-2. **Gap recovery.** Speech that Nemotron detected for at least `GAP_MIN_SECONDS` but that no OpenAI text covers is
-   cut out, transcribed on its own and attributed to that speaker. This recovers speech the transcription model drops,
-   for example under laughter.
-3. **Turn merging.** When two people talk over each other in fragments shorter than one second, each person's
-   fragments are regrouped first. Consecutive segments from the same speaker are then merged into turns.
-
-Overlapping speech is never cut up and re-transcribed. Very short or overlapping clips cause the transcription model
-to invent text, which is also why gap recovery ignores regions shorter than `GAP_MIN_SECONDS`.
-
-### 4. Naming
-
-For Teams imports that have a speaker-attributed Teams transcript, each Teams participant is matched to the Nemotron
-speaker they overlap most, with at most one name per speaker. Names can also be set or corrected at any time through
-the API.
-
-### 5. Minutes
-
-The transcript, with any known names applied, is sent to the minutes model. The model is instructed to use only what
-is said in the transcript and not to invent facts, owners or dates. For speakers that are still unnamed it may
-suggest a name, together with the quote that supports the suggestion. Suggestions are never applied automatically.
-
-## Requirements
-
-| Requirement | Notes |
-| --- | --- |
-| Python 3.11 or later | |
-| ffmpeg and ffprobe | Must be available on `PATH` |
-| NVIDIA GPU with CUDA | Required for practical diarization speed. Apple `mps` and CPU are supported but slow. |
-| OpenAI API key | Must have access to the transcription and minutes models |
-| Hugging Face CLI (`hf`) | Installed with `huggingface_hub`, used to download the diarization model |
-
-## Installation
-
-```bash
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
@@ -134,296 +40,212 @@ pip install -r requirements.txt
 cp .env.example .env
 ```
 
-Then set `OPENAI_API_KEY` in `.env`.
+Put your OpenAI key in `.env`, and put product names, project names and people's names in `KEYWORDS`. Transformers
+is installed from source because Nemotron 3 Diarization support isn't in a PyPI release yet. `download_model.sh`
+fetches only `config.json`, `processor_config.json` and `model.safetensors` (~400 MB).
 
-Notes:
+## Who engine
 
-- Transformers is installed from source because Nemotron 3 Diarization support is not yet in a PyPI release.
-- `download_model.sh` fetches only `config.json`, `processor_config.json` and `model.safetensors` (about 400 MB) into
-  `models/nemotron-3-diarization`. If that directory is missing, the model is downloaded from the Hugging Face Hub on
-  first start.
+Who runs in its own Node service. It needs Node 22 or newer.
 
-## Running the service
-
-### API server
-
-```bash
-source .venv/bin/activate
-uvicorn app.main:app --host 0.0.0.0 --port 8001
+```
+cd engines/who
+npm install
+npm start
 ```
 
-The diarization model is loaded at startup, so the first request is not delayed. Interactive API documentation is
-available at `http://localhost:8001/docs`.
+The first start downloads the model (about 32 MB) into `models/who/`; later starts load it from there. The service
+listens on `127.0.0.1:8090`. Start it before sending `who` jobs. Nemotron jobs don't need it.
 
-To keep the server running after disconnecting from a remote host such as EC2, start it inside tmux:
+On Linux the SDK runs the 8-bit LiteRT build on the CPU. It's the only build Desert Ant publishes for Linux: the
+float16 build is Core ML and runs only on Apple devices. LiteRT uses half the machine's cores, at most 8; set
+`DAL_LITERT_THREADS` to change that.
 
-```bash
+| Env var (engines/who) | Default        |                                                                          |
+| --------------------- | -------------- | ------------------------------------------------------------------------ |
+| `WHO_PORT`            | `8090`         |                                                                          |
+| `WHO_HOST`            | `127.0.0.1`    |                                                                          |
+| `WHO_MODEL_DIR`       | `models/who`   | where the model is cached                                                |
+| `WHO_MIN_SHARE`       | `0`            | drop speakers under this share of the speech, for laughs or jingles that get their own number. `0` keeps everyone |
+| `DAL_LITERT_THREADS`  | half the cores |                                                                          |
+
+```
+tmux new -s who
+cd engines/who && npm start
+```
+
+## Comparing engines
+
+```
+python compare.py <job_id>
+python compare.py <job_id> --engines who
+```
+
+`compare.py` runs each engine on a finished job's `audio.wav` and reuses its `text.json` and `timing.json`, so OpenAI is
+not called again. It prints speakers, turns, diarization time and how many times faster than real time each engine
+ran, then talk time per speaker. Full transcripts per engine go to `data/<id>/compare.json`.
+
+When the job has a Teams transcript, each engine also gets a **Teams agreement** score: for words that one Teams
+participant was speaking alone, the share that the engine gave to that participant. People on their own device are
+known for sure by Teams, so this is a real accuracy number with no hand labelling. Words from a shared room device
+count as that one participant, so meetings with room devices score lower for any engine that splits the room
+correctly; compare engines on meetings where everyone joins on their own device.
+
+Every job also records `diarization_seconds` and, with a Teams transcript, `teams_agreement` in its stats.
+
+## Run on EC2
+
+```
 tmux new -s meeting
 source .venv/bin/activate
 uvicorn app.main:app --host 0.0.0.0 --port 8001
 ```
 
-Detach with `Ctrl+B`, then `D`. Reattach with `tmux attach -t meeting`.
+Detach with `Ctrl+B` then `D`. For a public HTTPS link:
 
-### Temporary public URL
-
-A Cloudflare quick tunnel exposes the server over HTTPS without opening ports:
-
-```bash
+```
 tmux new -s tunnel
 cloudflared tunnel --url http://localhost:8001
 ```
 
-To print the current URL later:
+Print the link later with:
 
-```bash
+```
 tmux capture-pane -pt tunnel -S -500 | grep -o 'https://[a-z0-9-]*\.trycloudflare\.com' | tail -1
 ```
 
-The URL changes each time the tunnel restarts. The API has no authentication, so anyone with the URL can submit jobs
-and read results. Use the tunnel only for short-lived testing.
+Interactive docs are at `<link>/docs`. The link changes whenever the tunnel restarts, and anyone with it can use the API.
 
-### Command line
+From the terminal, without the server:
 
-The command-line runner processes one file without starting the server and prints the transcript, minutes and
-statistics:
-
-```bash
-python cli.py path/to/meeting.mp4
+```
+python cli.py samples/meeting.mp4
+python cli.py samples/meeting.mp4 --engine who
 ```
 
-Results are also written to a job folder under `data/`, as described in [Job storage](#job-storage).
+## API
 
-## API reference
+| Method  | Route                   |                                                                                          |
+| ------- | ----------------------- | ---------------------------------------------------------------------------------------- |
+| `GET`   | `/health`               | each engine's status, model names, keywords                                              |
+| `POST`  | `/jobs`                 | multipart `file`, any format ffmpeg reads, optional `engine` → `202` with the job        |
+| `POST`  | `/jobs/teams`           | `{"join_url": "...", "engine": "who"}`, imports the meeting's latest Teams recording → `202` with the job |
+| `GET`   | `/jobs/{id}`            | stage, error, stats                                                                      |
+| `GET`   | `/jobs/{id}/events`     | SSE, one event per stage change                                                          |
+| `GET`   | `/jobs/{id}/transcript` | turns with speaker names applied                                                         |
+| `GET`   | `/jobs/{id}/minutes`    | structured minutes                                                                       |
+| `PATCH` | `/jobs/{id}/speakers`   | `{"speaker_0": "Ramu"}`, an empty string removes a name                                  |
+| `POST`  | `/jobs/{id}/minutes`    | regenerate minutes with the current names                                                |
 
-| Method | Route | Description |
-| --- | --- | --- |
-| `GET` | `/health` | Service status, diarization device and mode, model names, and whether Teams import is enabled |
-| `POST` | `/jobs` | Upload a recording as multipart field `file`. Returns `202` with the job. |
-| `POST` | `/jobs/teams` | Import the latest recording of a Teams meeting. Body: `{"join_url": "..."}`. Returns `202` with the job. |
-| `GET` | `/jobs/{id}` | Job stage, error details and statistics |
-| `GET` | `/jobs/{id}/events` | Server-sent events, one `stage` event per stage change, closed when the job finishes |
-| `GET` | `/jobs/{id}/transcript` | Final turns with speaker names applied |
-| `GET` | `/jobs/{id}/minutes` | Structured minutes |
-| `PATCH` | `/jobs/{id}/speakers` | Set speaker names, for example `{"speaker_0": "Ramu"}`. An empty string removes a name. |
-| `POST` | `/jobs/{id}/minutes` | Regenerate the minutes using the current speaker names |
-
-Transcript, minutes and speaker endpoints return `409` until the job has reached `done`.
-
-### Example session
-
-```bash
-# Submit a recording
+```
 curl -F "file=@meeting.mp4" http://localhost:8001/jobs
-
-# Follow progress
+curl -F "file=@meeting.mp4" -F "engine=who" http://localhost:8001/jobs
 curl -N http://localhost:8001/jobs/<id>/events
-
-# Fetch results
 curl http://localhost:8001/jobs/<id>/transcript
 curl http://localhost:8001/jobs/<id>/minutes
-
-# Name speakers, then regenerate the minutes with those names
-curl -X PATCH -H "Content-Type: application/json" \
-  -d '{"speaker_0": "Ramu", "speaker_1": "Jaya"}' http://localhost:8001/jobs/<id>/speakers
-curl -X POST http://localhost:8001/jobs/<id>/minutes
 ```
 
-### Response formats
+Stages: `queued → (downloading) → extracting → analyzing → stitching → minutes → done`, or `failed` with `error_stage`.
+Errors: `404` unknown job or meeting, `409` job not finished or recording not ready, `413` upload too large, `415` not a media file, `422` unknown speaker or engine,
+`502` Microsoft Graph error, `503` Teams import not configured.
 
-Job:
+## Teams import
 
-```json
-{
-  "id": "497a5e91258d",
-  "filename": "meeting.mp4",
-  "source": "source.mp4",
-  "stage": "done",
-  "error": null,
-  "error_stage": null,
-  "speaker_names": {"speaker_0": "Ramu"},
-  "stats": {
-    "duration_seconds": 710.08,
-    "speakers": 4,
-    "turns": 80,
-    "gaps_filled": 3,
-    "processing_seconds": 258.0
-  },
-  "created_at": "2026-10-26T07:30:41Z",
-  "updated_at": "2026-10-26T07:35:12Z"
-}
-```
-
-Transcript:
-
-```json
-{
-  "speakers": {"speaker_0": "Ramu", "speaker_1": "speaker_1"},
-  "turns": [
-    {"start": 8.52, "end": 8.92, "speaker": "speaker_0", "name": "Ramu", "text": "Hello."}
-  ]
-}
-```
-
-Minutes:
-
-```json
-{
-  "title": "Deployment and Email Suggestion Review",
-  "summary": "...",
-  "key_points": ["..."],
-  "decisions": ["..."],
-  "action_items": [{"owner": "speaker_2", "task": "...", "due": ""}],
-  "open_questions": ["..."],
-  "speaker_suggestions": [{"speaker_id": "speaker_1", "name": "Sam", "evidence": "..."}]
-}
-```
-
-### Errors
-
-Errors are returned as `{"detail": "<message>"}`.
-
-| Status | Meaning |
-| --- | --- |
-| `404` | Unknown job, or no Teams meeting found for the join link |
-| `409` | Job not finished, or the Teams recording is not available yet |
-| `413` | Upload exceeds `MAX_UPLOAD_MB` |
-| `415` | File is not readable media or has no audio stream |
-| `422` | Speaker name request refers to a speaker not in the transcript |
-| `502` | Microsoft Graph returned an error |
-| `503` | Teams import is not configured |
-
-## Microsoft Teams import
-
-`POST /jobs/teams` looks up a meeting by its join link and imports the meeting's most recent recording. Both the long
-`/l/meetup-join/...` link and the short `/meet/<id>?p=<passcode>` link are accepted.
-
-The meeting and recording are checked before the job is created, so an unknown link returns `404` and a recording
-that is still processing returns `409` immediately. The MP4 is then downloaded in the background.
-
-### Azure and Teams setup
-
-1. Register an application in Microsoft Entra ID and create a client secret.
-2. Grant the application permissions `OnlineMeetings.Read.All`, `OnlineMeetingRecording.Read.All` and
-   `OnlineMeetingTranscript.Read.All`, and give admin consent.
-3. Create a Teams application access policy that allows the application to act for the meeting organiser.
-4. Set the following in `.env` and restart the service:
+`POST /jobs/teams` reads meetings through Microsoft Graph with an app-only token. It needs an Entra app with
+admin consent for `OnlineMeetings.Read.All`, `OnlineMeetingRecording.Read.All` and `OnlineMeetingTranscript.Read.All`,
+and a Teams application access policy covering the organiser. Set `TEAMS_TENANT_ID`, `TEAMS_CLIENT_ID`,
+`TEAMS_CLIENT_SECRET` and `TEAMS_ORGANIZER_ID` (the organiser's Entra object ID) in `.env`. Only meetings that
+organiser scheduled can be imported, and Record must have been pressed in the meeting.
 
 ```
-TEAMS_TENANT_ID=<directory (tenant) ID>
-TEAMS_CLIENT_ID=<application (client) ID>
-TEAMS_CLIENT_SECRET=<client secret>
-TEAMS_ORGANIZER_ID=<organiser's Entra object ID>
-```
-
-Only meetings scheduled by the configured organiser can be imported, and the meeting must have been recorded.
-
-```bash
 curl -X POST -H "Content-Type: application/json" \
-  -d '{"join_url": "https://teams.microsoft.com/meet/..."}' http://localhost:8001/jobs/teams
+  -d '{"join_url": "https://teams.microsoft.com/l/meetup-join/..."}' http://localhost:8001/jobs/teams
 ```
 
-### Speaker names from Teams
+The meeting and its recording are looked up before the job is created, so a wrong link returns `404` and a
+recording that is still processing returns `409` straight away. The MP4 then downloads in the background.
 
-If the meeting also has a Teams transcript, it is saved as `teams.vtt` and used to name speakers. People sharing a
-room microphone appear as one Teams participant, so only one of them receives the name. The others can be named
-with `PATCH /jobs/{id}/speakers`.
+When the meeting also has a Teams transcript, it is saved as `teams.vtt` and used to name the speakers: each Teams
+participant is matched to the speaker whose turns they overlap most, one name per speaker. People sharing a room
+microphone appear as one Teams participant, so only one of them gets the name. The rest can be renamed with
+`PATCH /jobs/{id}/speakers`. Reading Teams transcripts needs Graph transcript access switched on in the Teams admin
+center; without it the import still works, just without names.
 
-Some tenants disable speaker-attributed transcript content for applications. In that case Graph responds with
-`403 SpeakerAttributionNotAllowed`, the service logs a warning, and the job continues without names. Enabling this
-requires a change by a Microsoft 365 administrator.
+## Job files
 
-## Job storage
+Each job lives in `data/<id>/`:
 
-Each job is stored in its own folder, `data/<id>/`:
+| File              |                                                         |
+| ----------------- | ------------------------------------------------------- |
+| `job.json`        | stage, error, speaker names, stats                      |
+| `text.json`       | `gpt-transcribe` text per chunk                         |
+| `timing.json`     | `whisper-1` words with timestamps                       |
+| `speakers.json`   | the engine's segments: who spoke when                   |
+| `words.json`      | final words with time and speaker                       |
+| `teams.vtt`       | Teams transcript, only for Teams imports that have one  |
+| `transcript.json` | final turns                                             |
+| `minutes.json`    | minutes                                                 |
+| `compare.json`    | written by `compare.py`                                 |
 
-| File | Contents |
-| --- | --- |
-| `job.json` | Stage, error, speaker names and statistics |
-| `source.*` | The original upload or Teams recording |
-| `audio.wav` | 16 kHz mono audio used by both models |
-| `segments.json` | OpenAI output: text, timestamps and OpenAI's speaker label |
-| `speakers.json` | Nemotron output: who spoke when |
-| `gaps.json` | Speech recovered from gaps in OpenAI's output |
-| `teams.vtt` | Teams transcript, present only for Teams imports that have one |
-| `transcript.json` | Final turns |
-| `minutes.json` | Minutes |
-| `chunks/`, `gaps/` | Intermediate audio clips |
-
-When a transcript line looks wrong, compare `segments.json` and `speakers.json` over the same time range. An error in
-`segments.json` is a transcription error; an error in `speakers.json` is a diarization error; if both are correct,
-the problem is in stitching.
-
-Job folders are not deleted automatically.
+When a line has the wrong words, look at `text.json`. When it has the wrong speaker, compare `words.json` with
+`speakers.json` for that time range.
 
 ## Configuration
 
-All settings are read from environment variables, or from `.env` in the project root.
+| Env var                                                                           | Default                                          |                                                               |
+| --------------------------------------------------------------------------------- | ------------------------------------------------ | ------------------------------------------------------------- |
+| `OPENAI_API_KEY`                                                                  |                                                  | required                                                      |
+| `TRANSCRIBE_MODEL`                                                                | `gpt-transcribe`                                 | text                                                          |
+| `TIMING_MODEL`                                                                    | `whisper-1`                                      | word timestamps                                               |
+| `MINUTES_MODEL`                                                                   | `gpt-5.6-sol`                                    |                                                               |
+| `TRANSCRIBE_CONCURRENCY`                                                          | `4`                                              | parallel OpenAI requests                                      |
+| `TRANSCRIBE_PROMPT`                                                               | `A recorded work meeting with several speakers.` | context sent with every chunk                                 |
+| `KEYWORDS`                                                                        |                                                  | comma-separated terms the speakers use, also given to minutes |
+| `LANGUAGES`                                                                       | auto                                             | comma-separated codes, for example `en,ta`                    |
+| `DIARIZATION_ENGINE`                                                              | `nemotron`                                       | engine for jobs that don't name one: `nemotron` or `who`      |
+| `DIARIZATION_THRESHOLD`                                                           | `0.2`                                            | lowest speaker probability that counts as speech              |
+| `WHO_URL`                                                                         | `http://127.0.0.1:8090`                          | the Who service                                               |
+| `WHO_TIMEOUT_SECONDS`                                                             | `600`                                            |                                                               |
+| `DEVICE`                                                                          | auto (`cuda` → `mps` → `cpu`)                    | force a device                                                |
+| `MAX_UPLOAD_MB`                                                                   | `2048`                                           |                                                               |
+| `TEAMS_TENANT_ID`, `TEAMS_CLIENT_ID`, `TEAMS_CLIENT_SECRET`, `TEAMS_ORGANIZER_ID` |                                                  | enable `POST /jobs/teams`                                     |
+| `TEAMS_LOGIN_URL`, `TEAMS_GRAPH_URL`                                              | Microsoft endpoints                              |                                                               |
 
-| Variable | Default | Description |
-| --- | --- | --- |
-| `OPENAI_API_KEY` | | Required |
-| `TRANSCRIBE_MODEL` | `gpt-4o-transcribe-diarize` | Transcription model |
-| `MINUTES_MODEL` | `gpt-5.6-sol` | Minutes model |
-| `TRANSCRIBE_CONCURRENCY` | `4` | Maximum parallel transcription requests |
-| `OPENAI_TIMEOUT_SECONDS` | `600` | Timeout for each OpenAI request |
-| `OPENAI_MAX_RETRIES` | `3` | Retries for failed OpenAI requests |
-| `DIARIZATION_MODE` | `offline` | `offline` is the most accurate. `low_latency`, `very_low_latency` and `ultra_low_latency` process audio in chunks with constant GPU memory, for long meetings. |
-| `DIARIZATION_THRESHOLD` | `0.2` | Speech probability cutoff. Lower it to pick up quiet voices. |
-| `GAP_MIN_SECONDS` | `1.0` | Shortest uncovered speech region that is transcribed during gap recovery |
-| `DEVICE` | auto (`cuda`, then `mps`, then `cpu`) | Force a device for diarization |
-| `MAX_UPLOAD_MB` | `2048` | Maximum upload size |
-| `DATA_DIR` | `data` | Job storage directory |
-| `MODEL_DIR` | `models/nemotron-3-diarization` | Local diarization model directory |
-| `TEAMS_TENANT_ID`, `TEAMS_CLIENT_ID`, `TEAMS_CLIENT_SECRET`, `TEAMS_ORGANIZER_ID` | | All four are required to enable `POST /jobs/teams` |
-| `TEAMS_LOGIN_URL` | `https://login.microsoftonline.com` | Token endpoint base URL |
-| `TEAMS_GRAPH_URL` | `https://graph.microsoft.com/v1.0` | Graph API base URL |
+Keywords are hints. Keep the list to terms that are actually said in your meetings, since unused terms can
+occasionally appear in the text.
 
-## Troubleshooting
+## Limits
 
-| Symptom | Cause and resolution |
-| --- | --- |
-| Server fails to start with `OPENAI_API_KEY is not set` | Set the key in `.env`. |
-| `/health` reports `diarizer_device: cpu` | CUDA is not available to PyTorch. Check `nvidia-smi` and that the installed PyTorch build matches the CUDA driver. |
-| Job fails during `analyzing` with a CUDA out-of-memory error | The recording is too long for `offline` mode. Set `DIARIZATION_MODE=low_latency`. |
-| Job fails during `minutes` with a model error | The configured `MINUTES_MODEL` is not available to the API key. Set a model the key can use. |
-| `POST /jobs/teams` returns `503` | One or more `TEAMS_*` variables are missing. |
-| `POST /jobs/teams` returns `404` | The link is wrong, or the meeting was not scheduled by `TEAMS_ORGANIZER_ID`. |
-| `POST /jobs/teams` returns `409` | The meeting was not recorded, or Teams is still processing the recording. Retry later. |
-| Teams job finishes without speaker names | The meeting has no transcript, or the tenant blocks speaker-attributed transcripts. Check the server log for `SpeakerAttributionNotAllowed`. |
-| A quiet participant is missing from the transcript | Lower `DIARIZATION_THRESHOLD`. |
-| A job shows `failed` with `interrupted by server restart` | The server stopped while the job was running. Submit the recording again. |
+- Nemotron labels up to 8 speakers. Who labels up to 4 speakers in each five-minute section and matches voices across
+  sections. Who misses more speech on far-field room audio and when people talk over each other. Speakers are labelled
+  `speaker_0`, `speaker_1`, … by each engine.
+- When two speakers overlap in Who's output, a word goes to the lower-numbered one.
+- Who's license (Desert Ant Labs Source-Available 1.0) is written for on-device apps. Running it server-side on client
+  meetings needs written confirmation from Desert Ant Labs before production. Its native core also contacts Desert
+  Ant's license server; the audio itself stays on the machine.
+- Overlapping speech comes out as one stream of text. Each word goes to the most likely speaker, so a word said
+  over someone else can land on the louder person.
+- Nemotron's offline mode processes the recording in chunks internally, so GPU memory stays flat for long meetings.
+- Jobs that were running when the server stopped are marked `failed` on the next start.
 
-## Limitations
-
-- Up to 8 speakers per recording, labelled `speaker_0`, `speaker_1`, and so on in order of first appearance.
-- When people talk over each other, the text can read choppily, and a word spoken during overlap can be attributed to
-  the wrong person. Where OpenAI returns two people's words as a single segment, that segment cannot be split.
-- Very short utterances, such as a brief "okay" or greeting, are often missing because they fall below the gap
-  recovery threshold.
-- Product names, project names and other domain terms can be misheard, since the transcription model has no custom
-  vocabulary.
-- Capitalisation and punctuation from the transcription model can vary between runs of the same recording.
-- `offline` diarization keeps the whole recording in GPU memory. Test a recording of the expected maximum length
-  before relying on long meetings.
-- Jobs run in the server process. Jobs in progress when the server stops are marked `failed` on the next start.
-- The API has no authentication.
-
-## Project layout
+## Layout
 
 ```
 app/
-  main.py          FastAPI application and startup
-  bootstrap.py     Builds the OpenAI client, job store, models and pipeline
-  pipeline.py      Stage order and orchestration
-  api/             Routes for health, jobs and Teams import
-  audio/           Probing, conversion, silence detection and chunking (ffmpeg)
-  services/        Transcription, diarization, minutes and Microsoft Graph clients
-  processing/      Speaker assignment, gap recovery, turn merging and Teams name matching
-  jobs/            Disk-backed job store
-  schemas/         Pydantic models for jobs, transcripts and minutes
-  core/            Configuration and error types
-cli.py             Command-line runner
-download_model.sh  Downloads the diarization model
-samples/           Local test media (media files are not committed)
+  core/          config, errors
+  audio/         probe, convert (wav, samples, cut), silence, chunking
+  services/      transcription (OpenAI text + timing), diarization (engine registry), nemotron, who, minutes, teams (Graph)
+  processing/    align (text → word times), grid (turns → 10 ms grid), assign (word → speaker), turns,
+                 names (Teams → speakers), score (agreement with Teams), stitch
+  jobs/          job folders on disk
+  schemas/       job, transcript, minutes
+  api/           routes
+  pipeline.py    stage order
+  bootstrap.py   builds the services
+  main.py        FastAPI app
+engines/who/     Node service for Who
+samples/         test media
+cli.py           terminal runner, --engine
+compare.py       run every engine on a finished job
+download_model.sh
 ```
